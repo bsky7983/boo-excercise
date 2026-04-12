@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: todo-app
+  namespace: default
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: todo-app
+  template:
+    metadata:
+      labels:
+        app: todo-app
+    spec:
+      serviceAccountName: todo-app-sa # ClusterAdmin SA 사용
+      containers:
+      - name: todo-app
+      # ECR URL로 변경하세요!
+        image: 528757817598.dkr.ecr.ap-northeast-2.amazonaws.com/boo-exercise-app:latest
+        ports:
+        - containerPort: 3000
+      # 환경 변수
+        env:
+        - name: MONGODB_URI
+        # MongoDB VM의 Private IP로 변경하세요
+          value: "mongodb://todouser:TodoPass2024!@10.0.0.191:27017/todoapp"
+        - name: PORT
+          value: "3000"
+        resources:
+          requests:
+            cpu: 100m
+            memory: 128Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+        livenessProbe:
+           httpGet:
+             path: /health
+             port: 3000
+           initialDelaySeconds: 30
+           periodSeconds: 10

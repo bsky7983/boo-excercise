@@ -1,0 +1,159 @@
+name: '2.Build & Deploy Pipeline'
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  container-security-scan:
+    name: 'Container Security Scan'
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Docker 이미지 빌드 (스캔용)
+      run: docker build -t boo-exercise-app:scan ./app
+
+    - name: Trivy - 컨테이너 이미지 취약점 스캔
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'boo-exercise-app:scan'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        exit-code: '0'
+
+    - name: GitHub Security tab에 결과 업로드
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  build-and-push:
+    name: 'Build & Push to ECR'
+    runs-on: ubuntu-latest
+    needs: container-security-scan
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: AWS Credentials 설정
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    - name: ECR 로그인
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: 이미지 빌드 & ECR 푸시
+      id: build-image
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+      run: |
+        docker build -t $ECR_REGISTRY/boo-exercise-app:latest ./app
+        docker push $ECR_REGISTRY/boo-exercise-app:latest
+        echo "image=$ECR_REGISTRY/boo-exercise-app:latest" >> $GITHUB_OUTPUT
+
+  deploy:
+    name: 'Deploy to EKS'
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: AWS Credentials 설정
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+
+    - name: kubectl 설정
+      run: aws eks update-kubeconfig --region ${{ secrets.AWS_REGION }} --name boo-exercise-cluster
+
+    - name: Helm 설치
+      uses: azure/setup-helm@v3
+
+    - name: deployment.yaml에 실제 값 주입
+      env:
+        IMAGE: ${{ needs.build-and-push.outputs.image }}
+      run: |
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        MONGODB_PRIVATE_IP=$(aws ec2 describe-instances \
+          --filters "Name=tag:Name,Values=boo-exercise-mongodb" \
+                    "Name=instance-state-name,Values=running" \
+          --query 'Reservations[0].Instances[0].PrivateIpAddress' \
+          --output text)
+        sed -i "s|<AWS_ACCOUNT_ID>|$AWS_ACCOUNT_ID|g" k8s/deployment.yaml
+        sed -i "s|<MONGODB_PRIVATE_IP>|$MONGODB_PRIVATE_IP|g" k8s/deployment.yaml
+
+    - name: RBAC 배포 (ServiceAccount + ClusterRoleBinding)
+      run: kubectl apply -f k8s/rbac.yaml
+
+    - name: Deployment 배포
+      run: kubectl apply -f k8s/deployment.yaml
+
+    - name: Service 배포
+      run: kubectl apply -f k8s/service.yaml
+
+    - name: LB Policy JSON 다운로드
+      run: |
+        curl -o lb-policy.json \
+          https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/v2.6.0/docs/install/iam_policy.json
+
+    - name: AWS Load Balancer Controller 설치
+      run: |
+        helm repo add eks https://aws.github.io/eks-charts
+        helm repo update
+        aws iam create-policy \
+          --policy-name AWSLoadBalancerControllerIAMPolicy \
+          --policy-document file://lb-policy.json 2>/dev/null || echo "Policy already exists, skipping"
+        helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+          -n kube-system \
+          --set clusterName=boo-exercise-cluster \
+          --set serviceAccount.create=true
+        kubectl rollout status deployment/aws-load-balancer-controller \
+          -n kube-system --timeout=120s
+
+    - name: ingress.yaml에 서브넷 ID 주입
+      run: |
+        SUBNET_IDS=$(aws ec2 describe-subnets \
+          --filters "Name=tag:Name,Values=boo-exercise-public*" \
+          --query 'Subnets[*].SubnetId' \
+          --output text \
+          --region ${{ secrets.AWS_REGION }} | tr '\t' ',')
+        echo "서브넷 IDs: $SUBNET_IDS"
+        sed -i "s|PLACEHOLDER_SUBNETS|$SUBNET_IDS|g" k8s/ingress.yaml
+
+    - name: Ingress 배포
+      run: kubectl apply -f k8s/ingress.yaml
+
+    - name: 롤아웃 완료 대기
+      run: kubectl rollout status deployment/todo-app --timeout=300s
+
+    - name: 배포 결과 확인
+      run: |
+        kubectl get pods -o wide
+        kubectl get svc
+        kubectl get ingress
+
+    - name: ALB URL 확인
+      run: |
+        echo "ALB 생성 대기 중... (최대 3분)"
+        for i in {1..18}; do
+          ALB_URL=$(kubectl get ingress todo-app-ingress \
+            -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null)
+          if [ -n "$ALB_URL" ]; then
+            echo "웹 애플리케이션 URL: http://$ALB_URL"
+            break
+          fi
+          echo "  대기 중... ($((i*10))초)"
+          sleep 10
+        done
