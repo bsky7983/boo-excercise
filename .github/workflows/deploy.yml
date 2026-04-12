@@ -204,7 +204,6 @@ jobs:
         echo "MongoDB IP: $MONGODB_PRIVATE_IP"
         sed -i "s|<AWS_ACCOUNT_ID>|$AWS_ACCOUNT_ID|g" k8s/deployment.yaml
         sed -i "s|<MONGODB_PRIVATE_IP>|$MONGODB_PRIVATE_IP|g" k8s/deployment.yaml
-        sed -i "s|boo-exercise-app:latest|$IMAGE|g" k8s/deployment.yaml
 
     - name: RBAC 배포 (ServiceAccount + ClusterRoleBinding)
       run: kubectl apply -f k8s/rbac.yaml
