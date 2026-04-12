@@ -9,10 +9,11 @@ permissions:
   contents: read
   security-events: write
 
+jobs:
+
 # ──────────────────────────────────────────────────────────────
 # Job 1: 컨테이너 보안 스캔
 # ──────────────────────────────────────────────────────────────
-jobs:
   container-security-scan:
     name: 'Container Security Scan'
     runs-on: ubuntu-latest
@@ -68,24 +69,16 @@ jobs:
         echo "image=$ECR_REGISTRY/boo-exercise-app:latest" >> $GITHUB_OUTPUT
 
 # ──────────────────────────────────────────────────────────────
-# Job 3: ALB Controller 인프라 셋업 (최초 1회 or 변경 시만)
+# Job 3: ALB Controller 셋업 (push마다 실행, 모든 스텝 idempotent)
 #
-# [수정 핵심] IAM Policy URL을 v2.6.0 → latest로 변경
-#   - v2.6.0 policy에는 elasticloadbalancing:DescribeListenerAttributes
-#     가 누락되어 있음 → 현재 Helm chart 최신 버전 요구 권한과 불일치
-#   - latest URL을 사용하면 Helm chart 버전과 항상 일치
-#
-# [구조 개선] deploy job에서 IAM/IRSA/Helm 설치를 분리
-#   - 매 push마다 실행되면 iamserviceaccount 재생성 충돌 발생
-#   - workflow_dispatch(수동) 트리거로만 실행 가능하게 분리
+#   - IAM Policy : 없으면 생성 / 있으면 최신 버전으로 교체
+#   - IRSA       : --override-existing-serviceaccounts → 충돌 없음
+#   - Helm       : upgrade --install --wait → 없으면 install, 있으면 upgrade
 # ──────────────────────────────────────────────────────────────
   setup-alb-controller:
-    name: 'Setup ALB Controller (run once)'
+    name: 'Setup ALB Controller'
     runs-on: ubuntu-latest
     needs: build-and-push
-    # 수동 실행(workflow_dispatch) 시에만 이 job을 실행
-    # push 시에는 건너뜀 → 이미 설치된 경우 재충돌 방지
-    if: github.event_name == 'workflow_dispatch'
     steps:
     - uses: actions/checkout@v4
 
@@ -109,44 +102,41 @@ jobs:
           | tar xz -C /tmp
         sudo mv /tmp/eksctl /usr/local/bin
 
-    # ★ 핵심 수정: IAM Policy를 latest URL에서 받아옴
-    #   v2.6.0 고정 URL → main 브랜치 latest URL로 변경
-    #   DescribeListenerAttributes 등 신규 권한이 모두 포함된 버전
-    - name: LB Controller IAM Policy 생성 (latest)
+    - name: LB Controller IAM Policy 생성 or 최신화
       run: |
+        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+        POLICY_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy"
+
         curl -o lb-policy.json \
           https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
-        aws iam create-policy \
-          --policy-name AWSLoadBalancerControllerIAMPolicy \
-          --policy-document file://lb-policy.json 2>/dev/null \
-          || echo "Policy already exists — updating to latest version"
 
-        # 이미 존재하는 경우 최신 버전으로 교체
-        AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-        EXISTING=$(aws iam list-policy-versions \
-          --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy \
-          --query 'Versions[?!IsDefaultVersion].VersionId' \
-          --output text 2>/dev/null | head -1)
-
-        if [ -n "$EXISTING" ]; then
-          aws iam delete-policy-version \
-            --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy \
-            --version-id "$EXISTING" 2>/dev/null || true
+        if ! aws iam get-policy --policy-arn "$POLICY_ARN" > /dev/null 2>&1; then
+          aws iam create-policy \
+            --policy-name AWSLoadBalancerControllerIAMPolicy \
+            --policy-document file://lb-policy.json
+          echo "Policy 신규 생성 완료"
+        else
+          for VER in $(aws iam list-policy-versions \
+            --policy-arn "$POLICY_ARN" \
+            --query 'Versions[?!IsDefaultVersion].VersionId' \
+            --output text); do
+            aws iam delete-policy-version --policy-arn "$POLICY_ARN" --version-id "$VER"
+          done
+          aws iam create-policy-version \
+            --policy-arn "$POLICY_ARN" \
+            --policy-document file://lb-policy.json \
+            --set-as-default
+          echo "Policy 최신화 완료"
         fi
 
-        aws iam create-policy-version \
-          --policy-arn arn:aws:iam::${AWS_ACCOUNT_ID}:policy/AWSLoadBalancerControllerIAMPolicy \
-          --policy-document file://lb-policy.json \
-          --set-as-default 2>/dev/null || true
-
-    - name: OIDC Provider 연결
+    - name: OIDC Provider 연결 (이미 있으면 스킵됨)
       run: |
         eksctl utils associate-iam-oidc-provider \
           --region ${{ secrets.AWS_REGION }} \
           --cluster boo-exercise-cluster \
           --approve
 
-    - name: LB Controller용 IAM ServiceAccount 생성
+    - name: LB Controller IAM ServiceAccount 생성 or 업데이트
       run: |
         AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
         eksctl create iamserviceaccount \
@@ -157,7 +147,7 @@ jobs:
           --override-existing-serviceaccounts \
           --approve
 
-    - name: AWS Load Balancer Controller 설치 (Helm)
+    - name: AWS Load Balancer Controller 설치 or 업그레이드
       run: |
         helm repo add eks https://aws.github.io/eks-charts
         helm repo update
@@ -165,19 +155,20 @@ jobs:
           -n kube-system \
           --set clusterName=boo-exercise-cluster \
           --set serviceAccount.create=false \
-          --set serviceAccount.name=aws-load-balancer-controller
-        kubectl rollout status deployment/aws-load-balancer-controller \
-          -n kube-system --timeout=120s
+          --set serviceAccount.name=aws-load-balancer-controller \
+          --wait --timeout=120s
+
+    - name: ALB Controller 상태 확인
+      run: kubectl get pods -n kube-system | grep aws-load-balancer
 
 # ──────────────────────────────────────────────────────────────
-# Job 4: EKS 배포 (매 push마다 실행)
+# Job 4: EKS 배포
+# setup-alb-controller 완료 후 실행 → Ingress 배포 시 ALB Controller 보장
 # ──────────────────────────────────────────────────────────────
   deploy:
     name: 'Deploy to EKS'
     runs-on: ubuntu-latest
-    # setup-alb-controller는 workflow_dispatch에서만 실행되므로
-    # push 시에는 build-and-push 완료 후 바로 실행
-    needs: build-and-push
+    needs: [build-and-push, setup-alb-controller]
     steps:
     - uses: actions/checkout@v4
 
@@ -205,7 +196,7 @@ jobs:
         sed -i "s|<AWS_ACCOUNT_ID>|$AWS_ACCOUNT_ID|g" k8s/deployment.yaml
         sed -i "s|<MONGODB_PRIVATE_IP>|$MONGODB_PRIVATE_IP|g" k8s/deployment.yaml
 
-    - name: RBAC 배포 (ServiceAccount + ClusterRoleBinding)
+    - name: RBAC 배포
       run: kubectl apply -f k8s/rbac.yaml
 
     - name: Deployment 배포
