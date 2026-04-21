@@ -4,7 +4,7 @@
 # BOO Exercise - AWS 리소스 전체 삭제 스크립트
 # ============================================
 
-REGION="ap-northeast-2"
+REGION="us-east-1"
 PROJECT="boo-exercise"
 
 RED='\033[0;31m'

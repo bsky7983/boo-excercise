@@ -6,7 +6,7 @@
 # terraform 인프라는 건드리지 않습니다
 # ============================================
 
-REGION="ap-northeast-2"
+REGION="us-east-1"
 PROJECT="boo-exercise"
 
 RED='\033[0;31m'
