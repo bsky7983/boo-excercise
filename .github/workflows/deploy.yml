@@ -158,9 +158,10 @@ jobs:
           --wait --timeout=300s
 
     - name: ALB Controller 상태 확인
-      run: kubectl get pods -n kube-system | grep aws-load-balancer
-           kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller 
-           kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=180s
+      run: |
+        kubectl get pods -n kube-system | grep aws-load-balancer
+        kubectl get pods -n kube-system -l app.kubernetes.io/name=aws-load-balancer-controller 
+        kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=180s
 
 # ──────────────────────────────────────────────────────────────
 # Job 4: EKS 배포
